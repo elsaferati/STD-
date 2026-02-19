@@ -48,9 +48,43 @@ REPLY_EMAIL_BODY = (
 
 DASHBOARD_TOKEN = (os.getenv("DASHBOARD_TOKEN") or "").strip()
 _RAW_ALLOWED_ORIGINS = os.getenv("DASHBOARD_ALLOWED_ORIGINS", "")
-DASHBOARD_ALLOWED_ORIGINS = {
-    origin.strip() for origin in _RAW_ALLOWED_ORIGINS.split(",") if origin.strip()
-}
+
+
+def _normalize_origin(value: str | None) -> str:
+    return (value or "").strip().rstrip("/").lower()
+
+
+def _is_api_path(path: str | None) -> bool:
+    value = path or ""
+    return value == "/api" or value.startswith("/api/")
+
+
+def _build_allowed_origins(raw_origins: str) -> set[str]:
+    local_dev_origins = {
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    }
+    origins = {
+        _normalize_origin(origin)
+        for origin in raw_origins.split(",")
+        if _normalize_origin(origin)
+    }
+    if not origins:
+        origins = set(local_dev_origins)
+    elif any(
+        origin.startswith("http://localhost:")
+        or origin.startswith("http://127.0.0.1:")
+        for origin in origins
+    ):
+        origins.update(local_dev_origins)
+    return origins
+
+
+DASHBOARD_ALLOWED_ORIGINS = _build_allowed_origins(_RAW_ALLOWED_ORIGINS)
 ALLOW_ANY_ORIGIN = "*" in DASHBOARD_ALLOWED_ORIGINS
 API_INDEX_CACHE_TTL_SECONDS = max(
     0.5,
@@ -424,11 +458,12 @@ def require_auth(req) -> Any:
 
 
 def _is_origin_allowed(origin: str | None) -> bool:
-    if not origin:
+    normalized_origin = _normalize_origin(origin)
+    if not normalized_origin:
         return False
     if ALLOW_ANY_ORIGIN:
         return True
-    return origin in DASHBOARD_ALLOWED_ORIGINS
+    return normalized_origin in DASHBOARD_ALLOWED_ORIGINS
 
 
 def _append_vary(existing: str | None, value: str) -> str:
@@ -1007,14 +1042,14 @@ def _as_csv_text(orders: list[dict[str, Any]]) -> str:
 
 @app.before_request
 def _api_auth_guard():
-    if not request.path.startswith("/api/"):
+    if not _is_api_path(request.path):
         return None
     return require_auth(request)
 
 
 @app.after_request
 def _api_cors_headers(response: Response):
-    if not request.path.startswith("/api/"):
+    if not _is_api_path(request.path):
         return response
 
     origin = request.headers.get("Origin")
@@ -1031,7 +1066,7 @@ def _api_cors_headers(response: Response):
 
 @app.errorhandler(HTTPException)
 def _http_error_handler(error: HTTPException):
-    if not request.path.startswith("/api/"):
+    if not _is_api_path(request.path):
         return error
     code_map = {
         400: "bad_request",
@@ -1047,7 +1082,7 @@ def _http_error_handler(error: HTTPException):
 
 @app.errorhandler(500)
 def _internal_error_handler(error):
-    if not request.path.startswith("/api/"):
+    if not _is_api_path(request.path):
         return error
     return _api_error(500, "internal_error", "Unexpected server error")
 
