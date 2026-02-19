@@ -1,0 +1,297 @@
+"""
+Prompts for XXLUTZ order extraction.
+Handles two formats:
+1. Email body + PDF attachment (furnplan-style orders)
+2. Email body only (MÖMAX branch/Lagerbestellung orders)
+"""
+
+SYSTEM_PROMPT = (
+    "You are an expert order extraction system for XXLUTZ/MÖMAX furniture orders. "
+    "You extract structured data from order documents (emails, PDFs, images) into a consistent JSON schema. "
+    "\n\n"
+    "CRITICAL RULES:\n"
+    "1. Output field names MUST be in German as specified (kundennummer, artikelnummer, etc.)\n"
+    "2. NEVER use English field names like 'customer_number' or 'item_number' - these will break the system\n"
+    "3. Always use the EXACT field names from the required schema below\n"
+    "4. Return ONLY valid JSON matching the required structure"
+)
+
+ORDER_FORMAT_CLASSIFIER_SYSTEM_PROMPT = (
+    "You are an order format classifier for XXLUTZ/MOEMAX order emails. "
+    "Classify the order format using only the provided email metadata/content. "
+    "Return JSON only."
+)
+
+
+def build_user_instructions(source_priority: list[str]) -> str:
+    return (
+        "=== TASK ===\n"
+        "Extract order data from XXLUTZ/MÖMAX order documents (email body, PDF attachments).\n"
+        f"SOURCE TRUST PRIORITY: {', '.join(source_priority).upper()}\n"
+        "If conflicting data exists across sources, strictly TRUST sources in this priority order.\n"
+        "\n"
+        "=== CRITICAL: OUTPUT FIELD NAMES ===\n"
+        "You MUST use these EXACT German field names in your output:\n"
+        "  Header: ticket_number, kundennummer, adressnummer, kom_nr, kom_name, liefertermin, wunschtermin, bestelldatum, lieferanschrift, tour, store_name, store_address, seller, iln_anl, iln_fil\n"
+        "  Items: artikelnummer, modellnummer, menge, furncloud_id\n"
+        "\n"
+        "DO NOT use English names like: customer_number, item_number, quantity, delivery_date, etc.\n"
+        "These English names will cause data loss!\n"
+        "\n"
+        "=== XXLUTZ ORDER FORMATS ===\n"
+        "\n"
+        "XXLUTZ orders come primarily in the EMAIL BODY with optional furnplan PDF/TIF attachment.\n"
+        "The email contains structured text with labeled fields.\n"
+        "\n"
+        "### FORMAT 1: Standard XXLUTZ Order (Email + optional PDF)\n"
+        "Email typically starts with security warning (VORSICHT) and 'Mail:OFFICE-LUTZ@LUTZ.AT'\n"
+        "\n"
+        "EMAIL BODY FIELDS:\n"
+        "- Subject contains ticket number pattern like 'ticket number 1000001' -> ticket_number\n"
+        "- ILN Fields (CRITICAL - Extract as separate fields):\n"
+        "  - 'ILN-Anl :' → iln_anl (delivery location ILN, e.g., '9007019012285')\n"
+        "  - 'ILN-Fil :' → iln_fil (store/branch ILN, e.g., '9007019005744')\n"
+        "  - 'ILN-Anl :' ALSO maps to adressnummer (for backward compatibility)\n"
+        "  - (Ignore ILN-Lief - that is the supplier ILN)\n"
+        "  - ALWAYS extract both iln_anl AND iln_fil when present in the email\n"
+        "- 'KDNR:' or 'KDNR :' → kundennummer (extract the value as-is; may be 13-digit ILN or shorter Primex customer number; backend will resolve)\n"
+        "- 'Komm:' → kom_nr (e.g., 'SRX0TS-1', 'M2XD45-4')\n"
+        "- kom_name EXTRACTION (CRITICAL): kom_name is the SHORT commission/person name only (e.g. HABA, KREM, SCHWINGER) — the person who made the order. One word or short identifier.\n"
+        "  - If there is a SINGLE uppercase name line immediately before 'Komm:', treat that line as kom_name.\n"
+        "  - Example: 'SCHWINGER' followed by 'Komm: WDSR3L-3' → kom_name = 'SCHWINGER'. Example: 'HABA' or 'KREM' → kom_name = 'HABA' or 'KREM'.\n"
+        "  - NEVER put the full legal/company name (e.g. 'HABA GMBH & CO. KG', 'XXXLutz KG') in kom_name; that goes in store_name.\n"
+        "  - store_name can be the full company/branch (e.g. 'HABA GMBH & CO. KG Filiale Essen'). Do NOT confuse kom_name with store_name or seller (labels like 'Filiale:', 'Verkäufer:').\n"
+        "- 'Liefertermin:' → liefertermin (keep raw, e.g., 'KW08/2026, NICHT FRUEHER,NICHT SPAETER')\n"
+        "- 'ANLIEFERUNG:' or 'Anlieferung:' → lieferanschrift (full delivery address)\n"
+        "- 'Verkaeufer:' or 'Verkäufer:' → seller (e.g., 'FRAU SCHNIRZER SUSANNE')\n"
+        "- Store info from letterhead → store_name, store_address\n"
+        "  - Look for 'Filiale:' line with address\n"
+        "  - Company name from header (e.g., 'XXXLutz KG', 'BDSK Handels GmbH & Co. KG')\n"
+        "- Date after city name → bestelldatum (e.g., 'Steyr, den 02.01.26')\n"
+        "- 'furncloud: (xxxx xxxx)' → furncloud_id (e.g., 'yif3 aqz7' from 'furncloud: (yif3 aqz7)')\n"
+        "\n"
+        "=== ARTIKELNUMMER vs MODELLNUMMER: THE UNIVERSAL RULE ===\n"
+        "\n"
+        "WHAT IS AN ARTIKELNUMMER:\n"
+        "- ALWAYS starts with a DIGIT (0-9)\n"
+        "- Typically 4-6 digits, may have letter suffix (e.g., G)\n"
+        "- Examples: 60951, 09377G, 82347, 54434, 84006\n"
+        "\n"
+        "WHAT IS A MODELLNUMMER:\n"
+        "- ALWAYS starts with a LETTER (A-Z)\n"
+        "- Alphanumeric, common prefixes: CQ, OJ, ZB, SI, PD, INEG, SNSN, CQSN\n"
+        "- Examples: CQ9606XA, OJ99, ZB00, SI9191TA, PD16611616, INEG61EG12\n"
+        "\n"
+        "*** ONE SIMPLE RULE — First character decides: ***\n"
+        "  Starts with DIGIT → artikelnummer\n"
+        "  Starts with LETTER → modellnummer\n"
+        "  This rule works for ALL separators (hyphen, slash, space) and ALL formats.\n"
+        "\n"
+        "COMBINED CODE EXAMPLES (split, then apply the rule):\n"
+        "  'CQ9606XA-60951' → split on '-': CQ9606XA (starts C=letter → modellnummer), 60951 (starts 6=digit → artikelnummer)\n"
+        "  '56847-ZB99'     → split on '-': 56847 (starts 5=digit → artikelnummer), ZB99 (starts Z=letter → modellnummer)\n"
+        "  'OJ99-61469'     → split on '-': OJ99 (starts O=letter → modellnummer), 61469 (starts 6=digit → artikelnummer)\n"
+        "  '82347/INEG61EG12' → split on '/': 82347 (starts 8=digit → artikelnummer), INEG61EG12 (starts I=letter → modellnummer)\n"
+        "  'ZB 00 84006'    → join first two → ZB00 (starts Z=letter → modellnummer), last = 84006 (starts 8=digit → artikelnummer)\n"
+        "\n"
+        "LABEL MAPPING:\n"
+        "- 'TYP:' or 'TY:' (synonyms) → the value is artikelnummer OR a combined code to split\n"
+        "- 'AUSF:' or 'AF:' or 'AUF:' (synonyms) → the value is modellnummer\n"
+        "- When TYP/TY has a combined code (hyphen/slash/space), split it using the universal rule:\n"
+        "  'TYP: SI9191TA-66364' → split: SI9191TA → modellnummer, 66364 → artikelnummer\n"
+        "  'TYP: 82347/INEG61EG12' → split: 82347 → artikelnummer, INEG61EG12 → modellnummer\n"
+        "  'TYP: ZB 00 84006' → ZB00 → modellnummer, 84006 → artikelnummer\n"
+        "- When TYP/TY has a single numeric value: 'TYP: 54433' → artikelnummer='54433', modellnummer=''\n"
+        "- When TYP and AUSF appear together: 'TYP:54434,AUSF:PD16611616' → artikelnummer='54434', modellnummer='PD16611616'\n"
+        "  'TYP:18085,AF:SNSN71SP44' → artikelnummer='18085', modellnummer='SNSN71SP44'\n"
+        "\n"
+        "PLUS-JOINED CODES — Use FIRST code only:\n"
+        "- 'TYP: SI9191TA-66364+ZB00-46518' → use only 'SI9191TA-66364', IGNORE after '+'\n"
+        "  → Split: modellnummer='SI9191TA', artikelnummer='66364'\n"
+        "\n"
+        "ArtNr/Cikks WARNING:\n"
+        "- 'ArtNr:' and 'Cikks:' fields are STORE-INTERNAL references — ALWAYS IGNORE for extraction.\n"
+        "- DO NOT map ArtNr or Cikks to artikelnummer or modellnummer in ANY format.\n"
+        "\n"
+        "ZERO vs LETTER O WARNING:\n"
+        "- Article codes use the NUMBER ZERO (0), NOT the letter O!\n"
+        "- ZB00 = ZB + zero + zero (CORRECT). ZBO0 = WRONG.\n"
+        "\n"
+        "EXTRACTION PRIORITY:\n"
+        "1. TYP/AUSF/AF/AUF labels (highest priority) — split combined codes with universal rule\n"
+        "2. Hyphenated or slash codes in article lines — split with universal rule\n"
+        "3. NEVER use ArtNr or Cikks (internal store references)\n"
+        "\n"
+        "'X x' or 'X.00' prefix before article → menge (e.g., '1 x CQ9606XA-60951' → menge=1)\n"
+        "\n"
+        "### FORMAT 2: MÖMAX Branch Orders (Lagerbestellung - Email only, no PDF)\n"
+        "These come from MÖMAX branches (still under XXXLutz KG umbrella).\n"
+        "Look for 'Lagerbestellung:' in the email.\n"
+        "\n"
+        "EMAIL BODY FIELDS:\n"
+        "- Same ILN fields as Format 1\n"
+        "- 'Lagerbestellung:' contains kom_nr (e.g., 'CJIGS-1')\n"
+        "- '(ArtNr: ...)' and '(Cikks: ...)' are STORE-INTERNAL - DO NOT use for artikelnummer/modellnummer\n"
+        "- 'B/H/T in cm ca.' line contains dimensions (informational)\n"
+        "- 'Sachbearbeiter/in:' → seller\n"
+        "- Store from 'Filiale:' line → store_name, store_address\n"
+        "\n"
+        "MÖMAX ARTICLE EXTRACTION:\n"
+        "Apply the SAME universal rule above. TY: is a synonym for TYP:.\n"
+        "All the same patterns apply: hyphen splits, slash splits, spaced codes, plus-joined codes.\n"
+        "\n"
+        "COMPLETE EXAMPLES TABLE (all formats):\n"
+        "  'CQ9606XA-60951'              → modellnummer='CQ9606XA', artikelnummer='60951'\n"
+        "  'OJ99-61469'                  → modellnummer='OJ99', artikelnummer='61469'\n"
+        "  'CQ1111XP-67538'              → modellnummer='CQ1111XP', artikelnummer='67538'\n"
+        "  'CQ060606XA-64846'            → modellnummer='CQ060606XA', artikelnummer='64846'\n"
+        "  '56847-ZB99'                  → artikelnummer='56847', modellnummer='ZB99'\n"
+        "  '12345-AB12'                  → artikelnummer='12345', modellnummer='AB12'\n"
+        "  '82347/INEG61EG12'            → artikelnummer='82347', modellnummer='INEG61EG12'\n"
+        "  'ZB 00 84006'                 → modellnummer='ZB00', artikelnummer='84006'\n"
+        "  'SI9191TA-66364+ZB00-46518'   → modellnummer='SI9191TA', artikelnummer='66364'\n"
+        "  'TYP: 54433'                  → artikelnummer='54433', modellnummer=''\n"
+        "  'TYP:54434,AUSF:PD16611616'   → artikelnummer='54434', modellnummer='PD16611616'\n"
+        "  'TYP:18085,AF:SNSN71SP44'     → artikelnummer='18085', modellnummer='SNSN71SP44'\n"
+        "  '(Cikks: 05310128/03)'        → IGNORE\n"
+        "  '(ArtNr: 05310179/06)'        → IGNORE\n"
+        "\n"
+        "### MULTI-ORDER EMAILS:\n"
+        "Some XXLUTZ emails contain MULTIPLE commission numbers (e.g., Komm: KJNITY-1, KJNITY-2, etc.).\n"
+        "The attachment may contain items for ALL commissions.\n"
+        "HOW TO HANDLE:\n"
+        "- Use the FIRST commission number as kom_nr (e.g., 'KJNITY-1')\n"
+        "- Or combine all: 'KJNITY-1/2/3/4'\n"
+        "- Extract ALL items from ALL pages of the attachment into the items array\n"
+        "- Number items sequentially (line_no: 1, 2, 3, 4, 5...)\n"
+        "- DO NOT refuse to extract! Always output all items found.\n"
+        "\n"
+        "### STORE DETAILS (CRITICAL - Always extract if available):\n"
+        "- 'store_name': The furniture store/branch name\n"
+        "  - Look for: 'Filiale:', company letterhead\n"
+        "  - Examples: 'BDSK Handels GmbH & Co. KG – Filiale Essen', 'XXXLutz KG Filiale Steyr'\n"
+        "- 'store_address': The store's address (NOT delivery address)\n"
+        "  - Look for address under/near store name\n"
+        "- 'seller': The salesperson handling the order\n"
+        "  - Look for: 'Verkäufer:', 'Verkaeufer:', 'Sachbearbeiter/in:'\n"
+        "  - Often has 'HERR' or 'FRAU' prefix\n"
+        "\n"
+        "### PDF/TIF Attachment (furnplan style, if present):\n"
+        "- Article codes like 'CQ1111XP-67538' → same split rules as email\n"
+        "- 'Menge' or quantity column → menge\n"
+        "- '[xxxx xxxx]' bracket codes (may be sideways/rotated) → furncloud_id\n"
+        "- Model name in header (e.g., 'System One', 'Sigma') → modellnummer\n"
+        "- Extract ALL items from ALL pages - don't stop after first table!\n"
+        "\n"
+        "=== EXTRACTION RULES ===\n"
+        "1. Include ALL required keys, even if empty (use empty string '' and confidence=0.0)\n"
+        "2. Source values: 'pdf', 'email', 'image', or 'derived'\n"
+        "3. Keep Liefertermin/Wunschtermin as raw text (don't convert dates)\n"
+        "4. Extract ALL line items - don't collapse multiple items into one\n"
+        "5. If Furncloud ID found anywhere, apply to all items\n"
+        "6. 13-digit numbers starting with 40 or 90 are typically ILN/GLN\n"
+        "   - ILN-Anl → adressnummer (Delivery Location)\n"
+        "7. For 'Kommission: NUMBER, NAME' format, split into kom_nr and kom_name\n"
+        "8. Treat all attachments as the same order, merge items across pages\n"
+        "9. IF you find '+++ WEITERE INFO SIEHE ZEICHNUNG+++' anywhere:\n"
+        "   - Set header.human_review_needed.value = true\n"
+        "   - This means a human must check the drawing\n"
+        "10. DETECT 'REPLY NEEDED' CASES (Item Swaps/Substitutions):\n"
+        "    - Look for 'STATT TYP ... BITTE TYP ...' or similar swap requests\n"
+        "    - ACTION: Set header.reply_needed.value = true\n"
+        "11. DETECT 'POST CASE' INSTRUCTIONS:\n"
+        "    - If email asks to send directly by postal mail/letter (e.g. 'per Post', 'direkt per Post', 'per Brief')\n"
+        "    - ACTION: Set header.post_case.value = true\n"
+        "    - Keep this independent from reply_needed\n"
+        "12. CRITICAL - ZERO vs LETTER O in article codes:\n"
+        "    Article codes use the NUMBER ZERO (0), NOT the letter O!\n"
+        "    - ZB00-38337 = ZB + zero + zero (CORRECT)\n"
+        "    - ZBO0-38337 = WRONG (letter O instead of zero)\n"
+        "13. ADDRESS FORMATTING - Preserve proper spacing:\n"
+        "    - Keep space between street number and zip code\n"
+        "    - Use newlines (\\n) to separate address lines\n"
+        "\n"
+        "=== REQUIRED OUTPUT STRUCTURE ===\n"
+        "Your response must be valid JSON with EXACTLY this structure:\n"
+        "\n"
+        "{\n"
+        '  "message_id": "string",\n'
+        '  "received_at": "ISO-8601",\n'
+        '  "header": {\n'
+        '    "ticket_number": {"value": "1000001", "source": "email", "confidence": 1.0},\n'
+        '    "kundennummer": {"value": "65348", "source": "derived", "confidence": 1.0},\n'
+        '    "adressnummer": {"value": "9007019012285", "source": "email", "confidence": 0.95},\n'
+        '    "kom_nr": {"value": "SRX0TS-1", "source": "email", "confidence": 0.95},\n'
+        '    "kom_name": {"value": "RIESENHUBER", "source": "email", "confidence": 0.95},\n'
+        '    "liefertermin": {"value": "KW08/2026, NICHT FRUEHER,NICHT SPAETER", "source": "email", "confidence": 0.95},\n'
+        '    "wunschtermin": {"value": "", "source": "derived", "confidence": 0.0},\n'
+        '    "bestelldatum": {"value": "02.01.26", "source": "email", "confidence": 0.9},\n'
+        '    "lieferanschrift": {"value": "SAMESLEITEN 83\\nA-4490 ST.FLORIAN", "source": "email", "confidence": 0.95},\n'
+        '    "tour": {"value": "", "source": "derived", "confidence": 0.0},\n'
+        '    "store_name": {"value": "XXXLutz KG Filiale Steyr", "source": "email", "confidence": 0.9},\n'
+        '    "store_address": {"value": "Ennserstraße 33, 4400 Steyr", "source": "email", "confidence": 0.9},\n'
+        '    "seller": {"value": "FRAU SCHNIRZER SUSANNE", "source": "email", "confidence": 0.95},\n'
+        '    "iln_anl": {"value": "9007019012285", "source": "email", "confidence": 0.95},\n'
+        '    "iln_fil": {"value": "9007019005744", "source": "email", "confidence": 0.95},\n'
+        '    "human_review_needed": {"value": false, "source": "derived", "confidence": 1.0},\n'
+        '    "reply_needed": {"value": false, "source": "derived", "confidence": 1.0},\n'
+        '    "post_case": {"value": false, "source": "derived", "confidence": 1.0}\n'
+        '  },\n'
+        "When PDF kom_name differs from email, add to header: \"kom_name_pdf\": \"<PDF value>\" (string or {\"value\": \"...\"}).\n"
+        '  "items": [\n'
+        '    {\n'
+        '      "line_no": 1,\n'
+        '      "artikelnummer": {"value": "60951", "source": "email", "confidence": 0.95},\n'
+        '      "modellnummer": {"value": "CQ9606XA", "source": "email", "confidence": 0.9},\n'
+        '      "menge": {"value": 1, "source": "email", "confidence": 0.95},\n'
+        '      "furncloud_id": {"value": "yif3 aqz7", "source": "email", "confidence": 0.9}\n'
+        '    }\n'
+        '  ],\n'
+        '  "status": "ok",\n'
+        '  "warnings": [],\n'
+        '  "errors": []\n'
+        '}\n'
+        "\n"
+        "=== CONFLICTS AND WARNINGS ===\n"
+        "When kom_name (the short commission/person name, e.g. HABA or KREM) from the PDF is different from kom_name from the email, do BOTH: "
+        "(1) Set 'kom_name' to the value from the email body. "
+        "(2) Add header field 'kom_name_pdf' with the PDF value (e.g. \"kom_name_pdf\": \"Haba\" or \"kom_name_pdf\": {\"value\": \"Haba\"}). "
+        "The system will then add a warning. Do NOT add to the 'warnings' array yourself.\n"
+        "\n"
+        "=== STATUS VALUES ===\n"
+        "- 'ok': All required fields extracted successfully\n"
+        "- 'partial': Some fields missing or uncertain\n"
+        "- 'failed': Could not extract meaningful data\n"
+        "\n"
+        "REMEMBER: Use ONLY German field names (kundennummer, artikelnummer, etc.)\n"
+        "NEVER use English field names (customer_number, item_number, etc.)\n"
+    )
+
+
+def build_order_format_classifier_instructions() -> str:
+    return (
+        "=== TASK ===\n"
+        "Classify the incoming order into exactly one format.\n"
+        "\n"
+        "Allowed values:\n"
+        "- standard_xxxlutz: Standard XXLUTZ-style order (often with Komm:, ILN fields, and optional PDF/TIF)\n"
+        "- momax_branch: MOEMAX/MOMAX branch Lagerbestellung format (email-driven branch stock order)\n"
+        "- unknown: not enough evidence\n"
+        "\n"
+        "Primary signals for momax_branch:\n"
+        "- 'Lagerbestellung' in body/subject\n"
+        "- branch-style line items with TY/TYP + AUSF/AF patterns\n"
+        "- store workflow wording typical for branch stock orders\n"
+        "\n"
+        "Primary signals for standard_xxxlutz:\n"
+        "- Komm/Komm. fields, ILN-Anl/ILN-Fil, classic XXLUTZ order wording\n"
+        "- optional furnplan PDF/TIF attachment references\n"
+        "\n"
+        "Respond ONLY with JSON:\n"
+        "{\n"
+        '  "format": "standard_xxxlutz|momax_branch|unknown",\n'
+        '  "confidence": 0.0,\n'
+        '  "reason": "short explanation"\n'
+        "}\n"
+    )
+

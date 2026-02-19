@@ -1,0 +1,50 @@
+"""
+Prompt for the pre-classified standard XXLUTZ order format.
+"""
+
+from prompts_shared import build_shared_output_contract
+
+
+def build_user_instructions_standard_xxxlutz(source_priority: list[str]) -> str:
+    return (
+        "=== PRE-CLASSIFIED ORDER FORMAT ===\n"
+        "This order is classified as: standard_xxxlutz.\n"
+        "\n"
+        "=== TASK ===\n"
+        "Extract a Standard XXLUTZ order from email body and optional furnplan PDF/TIF attachments.\n"
+        f"SOURCE TRUST PRIORITY: {', '.join(source_priority).upper()}\n"
+        "If conflicting values exist, trust sources in this order.\n"
+        "\n"
+        "=== STANDARD XXLUTZ SIGNALS ===\n"
+        "- Email can include Komm/Kommission fields and ILN fields\n"
+        "- Typical keys: ILN-Anl, ILN-Fil, KDNR, Komm, Liefertermin, ANLIEFERUNG\n"
+        "- PDF/TIF may contain additional line items and furncloud IDs\n"
+        "- If both email and PDF have item tables, merge items from all pages/sources\n"
+        "\n"
+        "=== FIELD MAPPING (STANDARD XXLUTZ) ===\n"
+        "- Subject pattern 'ticket number <digits>' => ticket_number\n"
+        "- 'ILN-Anl' => iln_anl and also adressnummer\n"
+        "- 'ILN-Fil' => iln_fil\n"
+        "- 'KDNR' => kundennummer\n"
+        "- 'Komm' => kom_nr\n"
+        "- kom_name is short commission/person identifier (not full legal store name)\n"
+        "- 'Liefertermin' => liefertermin\n"
+        "- 'ANLIEFERUNG' or 'Anlieferung' => lieferanschrift\n"
+        "- 'Verkaeufer' and similar seller labels => seller\n"
+        "- Branch/company letterhead => store_name and store_address\n"
+        "- City-date pattern like 'Steyr, den 02.01.26' => bestelldatum\n"
+        "- 'furncloud: (xxxx xxxx)' => furncloud_id\n"
+        "\n"
+        "=== ITEM EXTRACTION (STANDARD XXLUTZ) ===\n"
+        "- Split combined article/model codes and apply universal first-character rule\n"
+        "- Use TYP/TY + AUSF/AF/AUF mapping when present\n"
+        "- Prefix like '1 x' or '1.00 x' => menge\n"
+        "- Extract all rows from all pages; keep sequential line_no\n"
+        "\n"
+        "=== MULTI-KOMMISSION HANDLING ===\n"
+        "- If multiple Komm numbers exist in one email, still output one merged order\n"
+        "- Keep first commission as kom_nr unless an explicit combined representation is obvious\n"
+        "- Do not drop items because of multiple commissions\n"
+        "\n"
+        + build_shared_output_contract()
+    )
